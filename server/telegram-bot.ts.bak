@@ -1,0 +1,826 @@
+import TelegramBot from "node-telegram-bot-api";
+import { config, validateConfig } from "./config";
+import { storage } from "./storage";
+import { log } from "./vite";
+import { generateResponse, handleBotCommandWithAI } from "./openai-service";
+import { InsertTelegramUser, InsertMessage, TelegramUser } from "@shared/schema";
+import { isValidBotCommand, truncateText } from "./utils";
+import { saveUserToSheets, logInteractionToSheets, initGoogleSheets } from "./google-sheets";
+import fs from "fs";
+import path from "path";
+
+// Bot instance
+let bot: TelegramBot;
+
+// Track silenced users globally
+const silencedUsers = new Set<number>();
+
+// Track manual intervention by admin
+const adminManagedChats = new Set<string>();
+
+/**
+ * Initialize and start the Telegram bot
+ */
+export async function initBot(): Promise<TelegramBot> {
+  validateConfig();
+  
+  // Create bot instance with polling
+  bot = new TelegramBot(config.telegramToken, { polling: true });
+  
+  log("Telegram bot initialized", "telegram");
+  
+  // Initialize Google Sheets integration if enabled
+  if (config.googleSheetsEnabled) {
+    const sheetsInitialized = await initGoogleSheets();
+    if (sheetsInitialized) {
+      log("Google Sheets integration initialized successfully", "telegram");
+    } else {
+      log("Google Sheets integration failed to initialize", "telegram");
+    }
+  }
+  
+  // Set custom profile photo if enabled
+  if (config.customBotAvatar) {
+    try {
+      const avatarPath = config.avatarPath;
+      if (fs.existsSync(avatarPath)) {
+        // Get bot info
+        const me = await bot.getMe();
+        // Unfortunately, bot.setMyPhoto is not available in this version of the library
+        // We can use the Send Photo API endpoint instead or other methods in future updates
+        log(`Custom avatar is configured but automatic setting is not available in this version of node-telegram-bot-api`, "telegram");
+        log(`To set the bot avatar, please use @BotFather manually with the image at ${avatarPath}`, "telegram");
+      } else {
+        log(`Avatar file not found at path: ${avatarPath}`, "telegram");
+      }
+    } catch (error: any) {
+      log(`Error with bot avatar configuration: ${error.message}`, "telegram");
+    }
+  }
+  
+  // Set bot commands
+  await bot.setMyCommands([
+    { command: '/start', description: 'Начать или перезапустить бота' },
+    { command: '/help', description: 'Показать справку' },
+    { command: '/contact', description: 'Оставить контактные данные' },
+    { command: '/reset', description: 'Сбросить историю разговора' },
+    { command: '/alertadmin', description: 'Связаться с оператором' },
+  ]);
+  
+  // Handle incoming messages
+  bot.on("message", async (msg) => {
+    try {
+      const chatId = msg.chat.id.toString();
+      const telegramId = msg.from?.id.toString() || "";
+      const messageText = msg.text || "";
+      const isGroup = msg.chat.type === 'group' || msg.chat.type === 'supergroup';
+      
+      // Handle contact info (phone number)
+      if (msg.contact && msg.contact.phone_number) {
+        await handleContactMessage(msg, telegramId, chatId);
+        return;
+      }
+      
+      if (!telegramId) {
+        log("Message received without user ID", "telegram");
+        return;
+      }
+      
+      log(`Message received from ${telegramId}: ${truncateText(messageText, 50)}`, "telegram");
+      
+      // Get or create user
+      let user = await storage.getTelegramUserByTelegramId(telegramId);
+      
+      // First-time user handling
+      if (!user) {
+        await createNewUser(telegramId, chatId, msg.from);
+        // Ask for username with welcome keyboard
+        await sendWelcomeMessage(chatId);
+        return;
+      }
+      
+      // User is waiting to set username
+      if (user.isWaitingForUsername) {
+        // Update username
+        await storage.updateTelegramUserUsername(user.id, messageText);
+        
+        // If collecting phone is enabled, ask for it
+        if (config.collectUserData) {
+          await askForPhone(chatId, user.id);
+        } else {
+          await bot.sendMessage(chatId, `Отлично! Ваше имя сохранено как: ${messageText}. Чем я могу помочь вам сегодня?`, {
+            reply_markup: getMainKeyboard()
+          });
+        }
+        return;
+      }
+      
+      // User is waiting to provide phone number
+      if (user.isWaitingForPhone && config.collectUserData) {
+        // If they sent text instead of using the button
+        if (messageText && !msg.contact) {
+          // Simple validation for phone format
+          const phoneRegex = /^(\+?[\d\s-]{10,15})$/;
+          if (phoneRegex.test(messageText.trim())) {
+            await storage.updateTelegramUserPhone(user.id, messageText.trim());
+            await bot.sendMessage(chatId, config.responseTemplates.phoneReceived, {
+              reply_markup: getMainKeyboard()
+            });
+          } else {
+            // Invalid phone format
+            await askForPhone(chatId, user.id, true); // resend with error message
+          }
+          return;
+        }
+      }
+      
+      // Store user message
+      await storage.createMessage({
+        telegramUserId: user.id,
+        content: messageText,
+        isFromUser: true
+      });
+      
+      // Log message to Google Sheets if enabled
+      if (config.googleSheetsEnabled) {
+        await logInteractionToSheets(
+          user.id,
+          telegramId,
+          messageText,
+          true,
+          'message'
+        );
+      }
+      
+      // Handle commands
+      if (messageText.startsWith("/")) {
+        await handleBotCommand(messageText, user.id, user.username || "Пользователь", chatId);
+        return;
+      }
+      
+      // Handle common keyboard button presses
+      if (messageText === config.buttonLabels.appointment) {
+        await bot.sendMessage(chatId, "Расскажите, пожалуйста, какая проблема со здоровьем вас беспокоит? Опишите подробно симптомы, как давно они появились, и какие методы лечения вы уже пробовали. Тысячи пациентов с похожими проблемами уже вылечились в Хуньчуне!", {
+          reply_markup: getMainKeyboard()
+        });
+        return;
+      }
+      
+      if (messageText === config.buttonLabels.question) {
+        await bot.sendMessage(chatId, "Цены на лечение в Хуньчуне в 3-5 раз ниже, чем в России! Лечение большинства заболеваний стоит от 30 до 200 тысяч рублей с проживанием. Точную стоимость рассчитаем после изучения вашей ситуации. Расскажите, пожалуйста, какая проблема вас беспокоит?", {
+          reply_markup: getMainKeyboard()
+        });
+        return;
+      }
+      
+      if (messageText === config.buttonLabels.learnAboutMedicine) {
+        await bot.sendMessage(chatId, "В Хуньчуне и Яньцзи более 30 специализированных клиник! Среди них: Центр ТКМ, Клиника доктора Вана, Международный медцентр, Госпиталь Дружбы и другие. Какое заболевание вас беспокоит? Я подскажу, какая клиника специализируется именно на вашей проблеме.", {
+          reply_markup: getMainKeyboard()
+        });
+        return;
+      }
+      
+      if (messageText === config.buttonLabels.aboutClinic) {
+        // Send information about tour booking
+        const tourInfo = "🧳 **Лечебный тур в Хуньчунь**\n\nМы организуем всё под ключ: виза + трансфер + проживание + лечение! Тысячи пациентов уже вылечились в наших клиниках.\n\nРасскажите, пожалуйста, какая проблема со здоровьем вас беспокоит? После этого пришлите результаты обследований, и только потом оставьте контакт - наш врач подберет для вас клинику и рассчитает стоимость.";
+        
+        await bot.sendMessage(chatId, tourInfo, {
+          parse_mode: "Markdown",
+          reply_markup: getMainKeyboard()
+        });
+        return;
+      }
+      
+      // Check if this chat is being managed by admin
+      if (adminManagedChats.has(telegramId)) {
+        // If admin is managing, forward message to admin
+        try {
+          // Send message to admin with user info
+          await bot.sendMessage(config.adminTelegramId, `💬 [${user.firstName || 'Пользователь'}]: ${messageText}`);
+          
+          // Store message but don't generate AI response
+          await storage.updateTelegramUserLastActive(user.id);
+          return;
+        } catch (error) {
+          log(`Error forwarding message to admin: ${error}`, "telegram");
+          // If failed to forward, proceed with regular bot processing
+        }
+      }
+      
+      // Check if user is silenced (unless it's an activation word)
+      if (user.isSilenced) {
+        const lowercaseMsg = messageText.toLowerCase();
+        const activationWords = config.conversationSettings.activationWords;
+        const containsActivationWord = activationWords.some(word => lowercaseMsg.includes(word));
+        
+        if (!containsActivationWord) {
+          log(`Ignoring message from silenced user ${user.id}`, "telegram");
+          return;
+        } else {
+          // Activate the bot again for this user
+          await storage.updateTelegramUserSilenceStatus(user.id, false);
+          await bot.sendMessage(chatId, `Я снова здесь и готов помочь вам! Чем могу быть полезен?`);
+        }
+      }
+      
+      // Send "typing" action
+      await bot.sendChatAction(chatId, "typing");
+      
+      // Generate AI response
+      const response = await generateResponse(messageText, user.username || "Пользователь", isGroup);
+      
+      // Store bot message
+      await storage.createMessage({
+        telegramUserId: user.id,
+        content: response,
+        isFromUser: false
+      });
+      
+      // Log bot response to Google Sheets if enabled
+      if (config.googleSheetsEnabled) {
+        await logInteractionToSheets(
+          user.id,
+          telegramId,
+          response,
+          false,
+          'message'
+        );
+      }
+      
+      // Special handling for different response types
+      if (response.includes("передаю ваше обращение нашему специалисту") || 
+          response.includes("я передаю ваше обращение")) {
+        // Transfer to human
+        await storage.transferToHuman(user.id);
+        await bot.sendMessage(chatId, response, {
+          reply_markup: getContactKeyboard()
+        });
+      } else if (response.includes("буду ожидать, когда вы снова захотите продолжить общение")) {
+        // Silence the bot for this user
+        await storage.updateTelegramUserSilenceStatus(user.id, true);
+        await bot.sendMessage(chatId, response);
+      } else if (response.includes("начинаем разговор заново")) {
+        // Reset conversation
+        await storage.resetConversation(user.id);
+        await bot.sendMessage(chatId, response, {
+          reply_markup: getMainKeyboard()
+        });
+      } else if ((response.includes("предлагаю продолжить наше общение в личных сообщениях") || 
+                response.includes("напишите мне в личные сообщения") || 
+                response.includes("личном чате")) && isGroup) {
+        // Invitation to private chat with button
+        const botInfo = await bot.getMe();
+        await bot.sendMessage(chatId, response, {
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: config.buttonLabels.privateChatButton, url: `https://t.me/${botInfo.username}` }]
+            ]
+          }
+        });
+      } else {
+        // Regular response
+        // For group chats, don't show keyboard
+        if (isGroup) {
+          await bot.sendMessage(chatId, response);
+        } else {
+          await bot.sendMessage(chatId, response, {
+            reply_markup: getMainKeyboard()
+          });
+        }
+      }
+      
+      // Update last activity
+      await storage.updateTelegramUserLastActive(user.id);
+      
+    } catch (error: any) {
+      log(`Error handling message: ${error.message}`, "telegram");
+    }
+  });
+  
+  // Handle callback queries (button clicks)
+  bot.on('callback_query', async (query) => {
+    if (!query.message || !query.from.id) return;
+    
+    const chatId = query.message.chat.id.toString();
+    const userId = query.from.id.toString();
+    const data = query.data || '';
+    
+    try {
+      // Check for takeover request from admin
+      if (data.startsWith('takeover_')) {
+        const targetUserId = data.replace('takeover_', '');
+        const success = await adminTakeOverConversation(userId, targetUserId);
+        
+        // Answer callback query with appropriate message
+        if (success) {
+          await bot.answerCallbackQuery(query.id, { text: "Вы подключились к чату с пользователем" });
+        } else {
+          await bot.answerCallbackQuery(query.id, { text: "Не удалось подключиться к чату" });
+        }
+        return;
+      }
+      
+      const user = await storage.getTelegramUserByTelegramId(userId);
+      if (!user) return;
+      
+      log(`Received callback query: ${data} from user ${userId}`, "telegram");
+      
+      switch (data) {
+        case 'contact':
+          // Check if we've collected enough info about user's problem
+          const recentMessages = await storage.getMessages(user.id, 10);
+          const userMessages = recentMessages.filter(msg => msg.isFromUser).map(msg => msg.content);
+          
+          if (userMessages.length < 2 || userMessages.join(' ').length < 50) {
+            // Not enough info collected
+            await bot.sendMessage(chatId, "Для качественной консультации расскажите сначала о вашей проблеме подробнее. Какое заболевание вас беспокоит? Как давно? Какие методы лечения вы уже пробовали? В Хуньчуне успешно лечат даже хронические заболевания!", {
+              reply_markup: getMainKeyboard()
+            });
+          } else {
+            // Start the contact info collection process
+            await askForPhone(chatId, user.id);
+          }
+          break;
+          
+        case 'appointment':
+          await bot.sendMessage(chatId, "Расскажите, пожалуйста, какая проблема со здоровьем вас беспокоит? Опишите подробно симптомы, как давно они появились. После этого пришлите результаты обследований если есть, и только потом мы запросим ваш контакт для связи.", {
+            reply_markup: getMainKeyboard()
+          });
+          break;
+          
+        case 'reset_conversation':
+          await storage.resetConversation(user.id);
+          await bot.sendMessage(chatId, "Начинаем разговор заново! Представьтесь, пожалуйста. Как я могу к вам обращаться? В Хуньчуне мы помогли тысячам пациентов вернуть здоровье!", {
+            reply_markup: {
+              remove_keyboard: true
+            }
+          });
+          break;
+          
+        case 'join_chat':
+          // This would typically lead to a group chat link
+          await bot.sendMessage(chatId, "Присоединяйтесь к нашему групповому чату, где уже более 500 пациентов делятся опытом лечения в Хуньчуне! [Ссылка будет добавлена]");
+          break;
+      }
+      
+      // Answer callback query to clear the loading state
+      await bot.answerCallbackQuery(query.id);
+      
+    } catch (error: any) {
+      log(`Error handling callback query: ${error.message}`, "telegram");
+    }
+  });
+  
+  // Handler for admin messages to users
+  bot.on("message", async (msg) => {
+    try {
+      // Skip non-admin messages
+      if (!msg.from || msg.from.id.toString() !== config.adminTelegramId) {
+        return;
+      }
+      
+      const adminId = msg.from.id.toString();
+      const messageText = msg.text || "";
+      
+      // Check for admin-to-user messages (format: @user_id message)
+      if (messageText.startsWith("@") && messageText.includes(" ")) {
+        const parts = messageText.split(" ");
+        const targetUserId = parts[0].substring(1); // Remove @ symbol
+        const responseText = parts.slice(1).join(" ");
+        
+        log(`Admin attempting to message user ${targetUserId}`, "telegram");
+        
+        // Forward message to user with error handling
+        try {
+          // Send message to target user
+          await bot.sendMessage(targetUserId, responseText);
+          log(`Admin message forwarded to user ${targetUserId}`, "telegram");
+          
+          // Add to admin-managed chats if not already there
+          if (!adminManagedChats.has(targetUserId)) {
+            adminManagedChats.add(targetUserId);
+            await bot.sendMessage(adminId, `✅ Вы теперь управляете чатом с пользователем ID: ${targetUserId}`);
+          }
+          
+          // Confirm to admin
+          await bot.sendMessage(adminId, `✅ Сообщение отправлено пользователю ${targetUserId}`);
+        } catch (err) {
+          // Handle errors during message sending
+          const errorMessage = err instanceof Error ? err.message : "Неизвестная ошибка";
+          await bot.sendMessage(adminId, `❌ Ошибка при отправке сообщения пользователю ${targetUserId}: ${errorMessage}`);
+          log(`Error sending admin message to user: ${errorMessage}`, "telegram");
+        }
+      }
+    } catch (error) {
+      // Handle outer errors
+      const errorMessage = error instanceof Error ? error.message : "Неизвестная ошибка";
+      log(`Error in admin message handler: ${errorMessage}`, "telegram");
+    }
+      }
+    } catch (error: any) {
+      log(`Error handling admin message: ${error.message}`, "telegram");
+    }
+  });
+  
+  // Handle bot errors
+  bot.on("polling_error", (error) => {
+    log(`Polling error: ${error.message}`, "telegram");
+  });
+  
+  return bot;
+}
+
+/**
+ * Create a welcome message with keyboard
+ */
+async function sendWelcomeMessage(chatId: string): Promise<void> {
+  await bot.sendMessage(chatId, config.defaultWelcomeMessage, {
+    reply_markup: {
+      remove_keyboard: true
+    }
+  });
+}
+
+/**
+ * Ask user for phone number
+ */
+async function askForPhone(chatId: string, userId: number, isRetry: boolean = false): Promise<void> {
+  const message = isRetry 
+    ? "Пожалуйста, введите корректный номер телефона или воспользуйтесь кнопкой 'Поделиться номером телефона'"
+    : config.responseTemplates.askForPhone;
+  
+  // Update user's status to waiting for phone
+  const user = await storage.getTelegramUser(userId);
+  if (user) {
+    // Apply updates to mark user as waiting for phone
+    try {
+      // If we have a username, update it to keep the same while flagging for phone
+      if (user.username) {
+        await storage.updateTelegramUserUsername(userId, user.username);
+      }
+    } catch (error) {
+      log(`Error updating user status: ${error}`, "telegram");
+    }
+  }
+  
+  await bot.sendMessage(chatId, message, {
+    reply_markup: {
+      keyboard: [
+        [{ 
+          text: config.buttonLabels.sharePhone, 
+          request_contact: true 
+        }]
+      ],
+      resize_keyboard: true,
+      one_time_keyboard: true
+    }
+  });
+}
+
+/**
+ * Handle received contact information
+ */
+async function handleContactMessage(
+  msg: TelegramBot.Message,
+  telegramId: string,
+  chatId: string
+): Promise<void> {
+  try {
+    const phone = msg.contact?.phone_number || "";
+    
+    if (!phone) {
+      await bot.sendMessage(chatId, "Не удалось получить номер телефона. Пожалуйста, попробуйте еще раз.");
+      return;
+    }
+    
+    const user = await storage.getTelegramUserByTelegramId(telegramId);
+    
+    if (!user) {
+      log(`Contact received but user not found: ${telegramId}`, "telegram");
+      return;
+    }
+    
+    // Update user's phone number
+    const updatedUser = await storage.updateTelegramUserPhone(user.id, phone);
+    
+    // Send confirmation
+    await bot.sendMessage(chatId, config.responseTemplates.phoneReceived, {
+      reply_markup: getMainKeyboard()
+    });
+    
+    // Log interaction
+    if (config.googleSheetsEnabled) {
+      await logInteractionToSheets(
+        user.id,
+        telegramId,
+        `Пользователь предоставил номер телефона: ${phone}`,
+        true,
+        'phone'
+      );
+      
+      // Save user data to Google Sheets
+      await saveUserToSheets(updatedUser, "Telegram Bot - Contact Button", "Пользователь добавил номер телефона через бота");
+    }
+    
+  } catch (error: any) {
+    log(`Error handling contact message: ${error.message}`, "telegram");
+  }
+}
+
+/**
+ * Get main keyboard
+ */
+function getMainKeyboard(): TelegramBot.ReplyKeyboardMarkup {
+  return {
+    keyboard: [
+      [{ text: config.buttonLabels.appointment }, { text: config.buttonLabels.question }],
+      [{ text: config.buttonLabels.learnAboutMedicine }, { text: config.buttonLabels.aboutClinic }],
+      [{ text: "🌟 Лечение в Хуньчуне" }, { text: "💰 Стоимость лечения" }],
+      [{ text: "🏥 Клиники Хуньчуня" }, { text: "🛂 Визы в Китай" }],
+      [{ text: "/alertadmin Связаться с оператором" }]
+    ],
+    resize_keyboard: true
+  };
+}
+
+/**
+ * Get contact keyboard
+ */
+function getContactKeyboard(): TelegramBot.InlineKeyboardMarkup {
+  return {
+    inline_keyboard: [
+      [{ text: config.buttonLabels.leaveContact, callback_data: "contact" }]
+    ]
+  };
+}
+
+/**
+ * Create a new user record
+ */
+async function createNewUser(
+  telegramId: string, 
+  chatId: string, 
+  from?: TelegramBot.User
+): Promise<InsertTelegramUser & { id: number }> {
+  const newUser: InsertTelegramUser = {
+    telegramId,
+    chatId,
+    firstName: from?.first_name || "",
+    lastName: from?.last_name || "",
+    username: from?.username || "",
+    phone: null,
+    isWaitingForUsername: true,
+    isWaitingForPhone: false,
+    isSilenced: false,
+    conversationHistory: null
+  };
+  
+  const createdUser = await storage.createTelegramUser(newUser);
+  
+  // Log new user to Google Sheets if enabled
+  if (config.googleSheetsEnabled) {
+    await saveUserToSheets(createdUser, "Telegram Bot - New User", "Новый пользователь начал общение с ботом");
+    await logInteractionToSheets(
+      createdUser.id, 
+      telegramId, 
+      "Начало взаимодействия с ботом", 
+      true,
+      'command'
+    );
+  }
+  
+  // Notify admin about new user if enabled
+  if (config.adminNotifications) {
+    await notifyAdmin(createdUser, "Новый пользователь начал общение с ботом", 'new_user');
+  }
+  
+  return createdUser;
+}
+
+/**
+ * Handle bot commands like /start and /help
+ */
+async function handleBotCommand(
+  command: string,
+  userId: number,
+  username: string,
+  chatId: string
+): Promise<void> {
+  try {
+    // Handle special commands
+    if (command === "/start") {
+      // Reset user state and ask for username again
+      await storage.resetConversation(userId);
+      await sendWelcomeMessage(chatId);
+      return;
+    }
+    
+    if (command === "/contact") {
+      // Check if we've collected enough info about user's problem
+      const recentMessages = await storage.getMessages(userId, 10);
+      const userMessages = recentMessages.filter(msg => msg.isFromUser).map(msg => msg.content);
+      
+      if (userMessages.length < 2 || userMessages.join(' ').length < 50) {
+        // Not enough info collected
+        await bot.sendMessage(chatId, "Для качественной консультации расскажите сначала о вашей проблеме подробнее. Какое заболевание вас беспокоит? Как давно? В Хуньчуне успешно лечат даже хронические заболевания, которые годами беспокоят пациентов!", {
+          reply_markup: getMainKeyboard()
+        });
+      } else {
+        // Request contact information
+        await askForPhone(chatId, userId);
+      }
+      return;
+    }
+    
+    if (command === "/reset") {
+      // Reset conversation
+      await storage.resetConversation(userId);
+      await bot.sendMessage(chatId, "История разговора очищена. Начинаем общение заново!", {
+        reply_markup: getMainKeyboard()
+      });
+      return;
+    }
+    
+    // Handle alert admin command
+    if (command.startsWith("/alertadmin")) {
+      await handleAlertAdminCommand(userId, chatId, command);
+      return;
+    }
+    
+    // Add command to bot commands list during initialization
+    if (command === "/help") {
+      const helpText = "Доступные команды:\n" +
+        "/start - Начать или перезапустить бота\n" +
+        "/help - Показать эту справку\n" +
+        "/contact - Оставить контактные данные\n" +
+        "/reset - Сбросить историю разговора\n" +
+        "/alertadmin - Связаться с оператором";
+      
+      await bot.sendMessage(chatId, helpText, {
+        reply_markup: getMainKeyboard()
+      });
+      return;
+    }
+    
+    // For other commands, use AI to generate response
+    const response = await handleBotCommandWithAI(command, username);
+    
+    // Store bot response
+    await storage.createMessage({
+      telegramUserId: userId,
+      content: response,
+      isFromUser: false
+    });
+    
+    // Send response with keyboard for standard commands
+    await bot.sendMessage(chatId, response, {
+      reply_markup: getMainKeyboard()
+    });
+  } catch (error: any) {
+    log(`Error handling command ${command}: ${error.message}`, "telegram");
+  }
+}
+
+/**
+ * Send notification to admin
+ */
+async function notifyAdmin(
+  telegramUser: TelegramUser, 
+  message: string, 
+  notificationType: 'new_user' | 'alert_admin' | 'human_takeover' = 'new_user'
+): Promise<boolean> {
+  try {
+    // Check if admin notifications are enabled and admin ID is set
+    if (!config.adminNotifications || !config.adminTelegramId) {
+      log('Admin notifications disabled or admin ID not set', 'telegram');
+      return false;
+    }
+    
+    // Format the notification message based on type
+    let notificationText = '';
+    
+    if (notificationType === 'new_user') {
+      notificationText = `🆕 НОВЫЙ ПОЛЬЗОВАТЕЛЬ\nИмя: ${telegramUser.firstName || 'Неизвестно'}\nUsername: ${telegramUser.username || 'Не указан'}\nID: ${telegramUser.telegramId}\nПервое сообщение: ${message || 'Начал общение с ботом'}`;
+    } 
+    else if (notificationType === 'alert_admin') {
+      notificationText = `🔔 ЗАПРОС ОТ ПОЛЬЗОВАТЕЛЯ\nИмя: ${telegramUser.firstName || 'Неизвестно'}\nUsername: ${telegramUser.username || 'Не указан'}\nID: ${telegramUser.telegramId}\nСообщение: ${message}`;
+    }
+    else if (notificationType === 'human_takeover') {
+      notificationText = `🔴 ЗАПРОС НА РУЧНОЕ УПРАВЛЕНИЕ\nИмя: ${telegramUser.firstName || 'Неизвестно'}\nUsername: ${telegramUser.username || 'Не указан'}\nID: ${telegramUser.telegramId}\nЗапрос: ${message}`;
+    }
+
+    // Get recent messages from user (last 5)
+    const recentMessages = await storage.getMessages(telegramUser.id, 5);
+    if (recentMessages && recentMessages.length > 0) {
+      notificationText += "\n\n📝 Последние сообщения:";
+      for (const msg of recentMessages) {
+        const fromLabel = msg.isFromUser ? "👤 Пользователь" : "🤖 Бот";
+        notificationText += `\n${fromLabel}: ${truncateText(msg.content, 100)}`;
+      }
+    }
+    
+    // Add take over button for admin
+    const inlineKeyboard = {
+      inline_keyboard: [
+        [
+          { 
+            text: '✅ Взять на себя разговор', 
+            callback_data: `takeover_${telegramUser.telegramId}` 
+          }
+        ]
+      ]
+    };
+    
+    // Send notification to admin
+    try {
+      await bot.sendMessage(config.adminTelegramId, notificationText, {
+        reply_markup: inlineKeyboard
+      });
+    } catch (adminError: any) {
+      log(`Failed to notify admin: ${adminError.message}`, 'telegram');
+    }
+    
+    log(`Admin notification sent: ${notificationType}`, 'telegram');
+    return true;
+  } catch (error: any) {
+    log(`Error sending admin notification: ${error.message}`, 'telegram');
+    return false;
+  }
+}
+
+/**
+ * Take over conversation as admin
+ */
+async function adminTakeOverConversation(adminId: string, userTelegramId: string): Promise<boolean> {
+  try {
+    // Verify this is really the admin
+    if (!config.adminTelegramId || adminId !== config.adminTelegramId) {
+      log(`Unauthorized takeover attempt by ${adminId}`, 'telegram');
+      return false;
+    }
+    
+    // Get user
+    const user = await storage.getTelegramUserByTelegramId(userTelegramId);
+    if (!user) {
+      log(`Takeover failed: User ${userTelegramId} not found`, 'telegram');
+      return false;
+    }
+    
+    // Mark this chat as managed by admin
+    adminManagedChats.add(userTelegramId);
+    
+    // Notify user that an operator has joined
+    await bot.sendMessage(userTelegramId, "👨‍💼 Оператор подключился к разговору и скоро ответит на ваши вопросы. Спасибо за ожидание!");
+    
+    // Notify admin
+    await bot.sendMessage(adminId, `✅ Вы подключились к разговору с пользователем ${user.username || user.firstName || 'Неизвестно'} (ID: ${userTelegramId})`);
+    
+    log(`Admin ${adminId} took over conversation with user ${userTelegramId}`, 'telegram');
+    return true;
+  } catch (error: any) {
+    log(`Error in admin takeover: ${error.message}`, 'telegram');
+    return false;
+  }
+}
+
+/**
+ * Handle alert admin command
+ */
+async function handleAlertAdminCommand(userId: number, chatId: string, message: string): Promise<void> {
+  try {
+    // Get user
+    const user = await storage.getTelegramUser(userId);
+    if (!user) {
+      log(`Alert admin failed: User ${userId} not found`, 'telegram');
+      return;
+    }
+    
+    // Extract message content (remove command part)
+    let alertMessage = message.replace('/alertadmin', '').trim();
+    if (!alertMessage) {
+      alertMessage = "Пользователь запросил оператора (без дополнительной информации)";
+    }
+    
+    // Notify admin
+    const notified = await notifyAdmin(user, alertMessage, 'alert_admin');
+    
+    // Respond to user
+    if (notified) {
+      await bot.sendMessage(chatId, "Ваш запрос передан оператору. Ожидайте ответа, обычно это занимает не более 10-15 минут в рабочее время.");
+    } else {
+      await bot.sendMessage(chatId, "К сожалению, сейчас невозможно связаться с оператором. Пожалуйста, попробуйте позже или продолжите общение с ботом.");
+    }
+  } catch (error: any) {
+    log(`Error handling alert admin command: ${error.message}`, 'telegram');
+  }
+}
+
+/**
+ * Stop the bot and end polling
+ */
+export function stopBot(): void {
+  if (bot) {
+    bot.stopPolling();
+    log("Telegram bot stopped", "telegram");
+  }
+}
