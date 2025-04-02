@@ -1,0 +1,55 @@
+# Подготовим код для Telegram-бота, чтобы он мог умно отвечать в группах с помощью OpenAI
+# Этот код нужно вставить в основной файл бота (например, main.py) в Replit
+
+code = '''
+import openai
+import telebot
+import os
+
+# Получаем токены из переменных окружения
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+bot = telebot.TeleBot(TELEGRAM_TOKEN)
+openai.api_key = OPENAI_API_KEY
+
+# Определим ключевые слова, на которые бот будет реагировать
+TRIGGER_KEYWORDS = ["спина", "давление", "зуб", "стоматолог", "цена", "миома", "женское", "бесплодие", "грыжа", "косметолог", "тур", "лечение", "записаться"]
+
+# Функция: определить, стоит ли отвечать
+def should_respond(message_text):
+    lowered = message_text.lower()
+    return any(keyword in lowered for keyword in TRIGGER_KEYWORDS)
+
+# Обработка всех сообщений
+@bot.message_handler(func=lambda message: True)
+def handle_all_messages(message):
+    if message.chat.type in ["group", "supergroup"]:
+        if should_respond(message.text):
+            response = ask_openai(message.text)
+            bot.reply_to(message, response)
+    elif message.chat.type == "private":
+        response = ask_openai(message.text)
+        bot.reply_to(message, response)
+
+# Функция запроса к OpenAI
+def ask_openai(prompt):
+    try:
+        completion = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "Ты — заботливый, умный и краткий ассистент Доктора Ху. Отвечай с теплотой, но по делу, коротко. Если вопрос сложный или непонятный — предложи написать доктору напрямую."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=100,
+            temperature=0.7
+        )
+        return completion.choices[0].message["content"].strip()
+    except Exception as e:
+        return "Прошу прощения, возникла ошибка. Напишите, пожалуйста, доктору напрямую 🙏"
+
+print("🤖 Умный бот запущен и слушает группу...")
+bot.polling()
+'''
+
+code

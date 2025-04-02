@@ -1,0 +1,55 @@
+from telegram import Bot, Update, ReplyKeyboardMarkup
+from telegram.ext import Updater, MessageHandler, Filters, CallbackContext, CommandHandler
+import os
+
+# === Константы ===
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+
+WELCOME_MESSAGE = (
+    "👋 Приветствуем! Я Секретарь Доктора Ху 🤓\n"
+    "Задайте свой вопрос — я всё расскажу!\n"
+    "Если нужно связаться с человеком — просто напишите или нажмите кнопку 👇"
+)
+
+AUTO_RESPONSES = {
+    "цена": "💰 Стоимость зависит от сезона, клиники и акций. Давайте обсудим в личке — напишите, пожалуйста!",
+    "стоимость": "💬 Точную цену могу подсказать в личке, так как всё меняется в зависимости от услуг и сезона.",
+    "как записаться": "📝 Напишите, пожалуйста, имя и телефон — я передам вас администратору.",
+    "где вы находитесь": "📍 Мы находимся в городе Хуньчунь, Китай. Работаем уже более 25 лет!",
+    "виза": "🛂 Мы оформляем визовые туры по Китаю. Индивидуально и в группе — всё сделаем красиво 😊"
+}
+
+# === Функции ===
+
+def start(update: Update, context: CallbackContext):
+    chat_id = update.effective_chat.id
+    message = context.bot.send_message(chat_id=chat_id, text=WELCOME_MESSAGE)
+    try:
+        context.bot.pin_chat_message(chat_id=chat_id, message_id=message.message_id)
+    except:
+        pass  # Игнорируем ошибку, если бот не может закрепить
+
+
+def handle_message(update: Update, context: CallbackContext):
+    text = update.message.text.lower()
+    for key, response in AUTO_RESPONSES.items():
+        if key in text:
+            update.message.reply_text(response)
+            return
+    # Если нет автоответа — можно подключить ChatGPT здесь:
+    update.message.reply_text("Доктор Ху думает... 🤔 (ответ от OpenAI будет здесь)")  # <-- заглушка
+
+# === Запуск ===
+
+def main():
+    updater = Updater(token=TELEGRAM_TOKEN, use_context=True)
+    dispatcher = updater.dispatcher
+
+    dispatcher.add_handler(CommandHandler("start", start))
+    dispatcher.add_handler(MessageHandler(Filters.text & (~Filters.command), handle_message))
+
+    updater.start_polling()
+    updater.idle()
+
+if __name__ == '__main__':
+    main()
